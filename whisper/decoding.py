@@ -113,6 +113,10 @@ class DecodingOptions:
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
+    # token idx suppression for perturbation
+    perturbation_tokens: Optional[Dict[int, float]] = None
+    perturbation: bool = False  # this will suppress blank outputs
+
 
 @dataclass(frozen=True)
 class DecodingResult:
@@ -125,6 +129,7 @@ class DecodingResult:
     no_speech_prob: float = np.nan
     temperature: float = np.nan
     compression_ratio: float = np.nan
+    logits : Tensor = None
 
 
 class Inference:
@@ -152,7 +157,7 @@ class PyTorchInference(Inference):
         value_modules = [block.attn.value for block in self.model.decoder.blocks]
         self.kv_modules = key_modules + value_modules
 
-    def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
+    def logits(self, tokens: Tensor, audio_features: Tensor, perturbation: Optional[bool]=False, perturbation_tokens: Optional[Dict[int, float]] = None ) -> Tensor:
         if not self.kv_cache:
             self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
 
@@ -160,6 +165,10 @@ class PyTorchInference(Inference):
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
+        if perturbation:
+            # print('In PyTorchInference logits function, perturbation =',perturbation)
+            return self.model.decoder.forward(tokens, audio_features, kv_cache=self.kv_cache)
+        
         return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
 
     def cleanup_caching(self):
@@ -527,6 +536,7 @@ class DecodingTask:
         self.n_group: int = options.beam_size or options.best_of or 1
         self.n_ctx: int = model.dims.n_text_ctx
         self.sample_len: int = options.sample_len or model.dims.n_text_ctx // 2
+        self.n_vocab = model.dims.n_vocab
 
         self.sot_sequence: Tuple[int] = tokenizer.sot_sequence
         if self.options.without_timestamps:
@@ -640,8 +650,9 @@ class DecodingTask:
             suppress_tokens.append(self.tokenizer.no_speech)
 
         return tuple(sorted(set(suppress_tokens)))
-
-    def _get_audio_features(self, mel: Tensor):
+    
+# Added suppression and perturbation
+    def _get_audio_features(self, mel: Tensor, perturbation: Optional[bool]=False,perturbation_tokens: Optional[Dict[int, float]] = None):
         if self.options.fp16:
             mel = mel.half()
 
@@ -652,7 +663,9 @@ class DecodingTask:
             # encoded audio features are given; skip audio encoding
             audio_features = mel
         else:
-            audio_features = self.model.encoder(mel)
+            # Add here
+            # print('In _get_audio_features perturbation =',perturbation)
+            audio_features = self.model.encoder.forward(mel,suppression=perturbation, perturbation=perturbation_tokens) 
 
         if audio_features.dtype != (
             torch.float16 if self.options.fp16 else torch.float32
@@ -677,14 +690,20 @@ class DecodingTask:
 
         return languages, lang_probs
 
-    def _main_loop(self, audio_features: Tensor, tokens: Tensor):
+    def _main_loop(self, audio_features: Tensor, tokens: Tensor, perturbation: Optional[bool]=False,perturbation_tokens: Optional[Dict[int, float]] = None, all_logits = None):
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
 
+        all_logits : Tensor = torch.empty(self.sample_len, self.n_vocab, dtype=torch.float32, device=audio_features.device)
+
+        # print('In main loop, perturbation=', perturbation)
+
         try:
             for i in range(self.sample_len):
-                logits = self.inference.logits(tokens, audio_features)
+                logits = self.inference.logits(tokens, audio_features, perturbation=perturbation, perturbation_tokens= perturbation_tokens)
+                
+                # print('logit shape:',logits[:, -1].shape)
 
                 if (
                     i == 0 and self.tokenizer.no_speech is not None
@@ -694,6 +713,7 @@ class DecodingTask:
 
                 # now we need to consider the logits at the last token only
                 logits = logits[:, -1]
+                all_logits[i,:] = logits
 
                 # apply the logit filters, e.g. for suppressing or applying penalty to
                 for logit_filter in self.logit_filters:
@@ -707,15 +727,18 @@ class DecodingTask:
         finally:
             self.inference.cleanup_caching()
 
-        return tokens, sum_logprobs, no_speech_probs
+        return tokens, sum_logprobs, no_speech_probs, all_logits
 
     @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
+        all_logits = []
 
-        audio_features: Tensor = self._get_audio_features(mel)  # encoder forward pass
+        audio_features: Tensor = self._get_audio_features(mel, perturbation=self.options.perturbation, perturbation_tokens=self.options.perturbation_tokens)  # encoder forward pass
+        # print('Audio feature generated', audio_features.shape)
+
         tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
 
         # detect language if requested, overwriting the language token
@@ -734,10 +757,12 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens)
-
+        tokens, sum_logprobs, no_speech_probs, all_logits = self._main_loop(audio_features, tokens,perturbation=self.options.perturbation, perturbation_tokens=self.options.perturbation_tokens, all_logits=all_logits)
+        # print('shape of all_logits',all_logits.shape)
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
+        
         audio_features = audio_features[:: self.n_group]
+        # print('Audio feature shape after reshaping the tensors to have (n_audio, n_group) as the first two dimensions:', audio_features.shape)
         no_speech_probs = no_speech_probs[:: self.n_group]
         assert audio_features.shape[0] == len(no_speech_probs) == n_audio
 
@@ -767,7 +792,7 @@ class DecodingTask:
             tokens,
             audio_features,
             avg_logprobs,
-            no_speech_probs,
+            no_speech_probs
         )
         if len(set(map(len, fields))) != 1:
             raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
@@ -782,6 +807,7 @@ class DecodingTask:
                 no_speech_prob=no_speech_prob,
                 temperature=self.options.temperature,
                 compression_ratio=compression_ratio(text),
+                logits=all_logits
             )
             for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
                 *fields

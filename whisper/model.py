@@ -21,6 +21,8 @@ except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
     SDPA_AVAILABLE = False
 
+# Temporary
+SDPA_AVAILABLE = False
 
 @dataclass
 class ModelDimensions:
@@ -95,6 +97,7 @@ class MultiHeadAttention(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None
     ):
         q = self.query(x)
 
@@ -108,11 +111,11 @@ class MultiHeadAttention(nn.Module):
             k = kv_cache[self.key]
             v = kv_cache[self.value]
 
-        wv, qk = self.qkv_attention(q, k, v, mask)
+        wv, qk = self.qkv_attention(q, k, v, mask, suppression,perturbation)
         return self.out(wv), qk
 
     def qkv_attention(
-        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None, suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         n_batch, n_ctx, n_state = q.shape
         scale = (n_state // self.n_head) ** -0.25
@@ -120,6 +123,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
+        # print('In qkv attention, perturbation:', suppression)
         if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
             a = scaled_dot_product_attention(
                 q, k, v, is_causal=mask is not None and n_ctx > 1
@@ -128,9 +132,19 @@ class MultiHeadAttention(nn.Module):
             qk = None
         else:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
+
+            # AtMan - supression effect added
+            # print(f'q shape:{q.shape}, k shape:{k.shape,}, qkT shape: {qk.shape}')
+            if suppression:
+                # print('In qkv attention, perturbation:', suppression)
+                for token_idx, factor in perturbation.items():
+                    qk[:, :, token_idx,:] *= factor 
+
             if mask is not None:
                 qk = qk + mask[:n_ctx, :n_ctx]
             qk = qk.float()
+
+            
 
             w = F.softmax(qk, dim=-1).to(q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
@@ -163,10 +177,12 @@ class ResidualAttentionBlock(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None
     ):
-        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache, suppression = suppression,perturbation = perturbation)[0]
+        # print(f'Residual attention forward shape of x after self.attention:{x.shape}')
         if self.cross_attn:
-            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
+            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache, suppression = suppression,perturbation = perturbation)[0]
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
@@ -185,7 +201,7 @@ class AudioEncoder(nn.Module):
         )
         self.ln_post = LayerNorm(n_state)
 
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None):
         """
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
@@ -198,7 +214,7 @@ class AudioEncoder(nn.Module):
         x = (x + self.positional_embedding).to(x.dtype)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, suppression = suppression,perturbation = perturbation)
 
         x = self.ln_post(x)
         return x
@@ -224,7 +240,7 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None, suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -237,9 +253,10 @@ class TextDecoder(nn.Module):
             + self.positional_embedding[offset : offset + x.shape[-1]]
         )
         x = x.to(xa.dtype)
+        # print(f'In forward of Text Decoder, x shape  (batch_size, <= n_ctx) the text tokens {x.shape}, xa shape (batch_size, n_audio_ctx, n_audio_state) {xa.shape}')
 
         for block in self.blocks:
-            x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+            x = block(x, xa, mask=self.mask, kv_cache=kv_cache, suppression = suppression,perturbation = perturbation)
 
         x = self.ln(x)
         logits = (
@@ -287,13 +304,13 @@ class Whisper(nn.Module):
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder(mel)
 
-    def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
-        return self.decoder(tokens, audio_features)
+    def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor,suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None ):
+        return self.decoder(tokens, audio_features, suppression = suppression,perturbation = perturbation)
 
     def forward(
-        self, mel: torch.Tensor, tokens: torch.Tensor
+        self, mel: torch.Tensor, tokens: torch.Tensor, suppression: Optional[bool] = False,  perturbation: Optional[Dict[int, float]] = None 
     ) -> Dict[str, torch.Tensor]:
-        return self.decoder(tokens, self.encoder(mel))
+        return self.decoder(tokens, self.encoder(mel), suppression = suppression,perturbation = perturbation)
 
     @property
     def device(self):
@@ -339,6 +356,49 @@ class Whisper(nn.Module):
 
         self.decoder.apply(install_hooks)
         return cache, hooks
+    
+    # Added for attention mask
+    def get_modified_causal_attention_mask(self, seq_len, suppression_token_indices, suppression_factors, use_log=False):
+        ## attention_mask is basically the causal mask
+        # attention_mask so far has shape [1, 1, seq, seq] in dtype bool
+        # it is True whenever a value has to be masked out (i.e. not used in softmax)
+        # convert such that 1 whenevser a value has to be kept and zero for masking out
+        # there would be different attention masks for different batch items
+
+        ## this fancy indexing on bias is hopefully equivalent to: causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+        attention_mask = self.transformer.h[0].attn.attention.bias[:, :, 0 : seq_len, :seq_len]
+        attention_mask_factors = torch.ones_like(attention_mask, dtype=torch.float32)
+        batch_size = len(suppression_token_indices)
+
+        if attention_mask_factors.shape[0] != batch_size:
+            attention_mask_factors = attention_mask_factors.repeat_interleave(
+                batch_size, dim=0
+            )
+
+        for batch_index in range(batch_size):
+
+            assert len(suppression_token_indices[batch_index]) == len(
+                suppression_factors[batch_index]
+            ), f"The lengths of suppression_token_indices[{batch_index}]: {len(suppression_token_indices[batch_index])} and suppression_factors[{batch_index}]: {suppression_factors[batch_index]} are not equal"
+
+            for token_index, factor in zip(
+                suppression_token_indices[batch_index],
+                suppression_factors[batch_index],
+            ):
+
+                ## do nothing if token_index is -1 or None
+                if token_index == -1 or token_index is None:
+                    continue
+
+                if use_log:
+                    attention_mask_factors[batch_index, :, :, token_index] = torch.log(
+                        torch.tensor(factor)
+                    ).to(attention_mask_factors.device)
+                else:
+                    attention_mask_factors[batch_index, :, :, token_index] =  torch.tensor(factor).to(attention_mask_factors.device)
+
+        return attention_mask_factors
+
 
     detect_language = detect_language_function
     transcribe = transcribe_function
