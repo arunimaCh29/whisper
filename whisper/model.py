@@ -135,7 +135,7 @@ class MultiHeadAttention(nn.Module):
 
             # AtMan - supression effect added
             # print(f'q shape:{q.shape}, k shape:{k.shape,}, qkT shape: {qk.shape}')
-            if suppression:
+            if suppression and perturbation is not None:
                 # print('In qkv attention, perturbation:', suppression)
                 for token_idx, factor in perturbation.items():
                     qk[:, :, token_idx,:] *= factor 
