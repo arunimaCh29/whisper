@@ -114,8 +114,8 @@ class DecodingOptions:
     fp16: bool = True  # use fp16 for most of the calculation
 
     # token idx suppression for perturbation
-    perturbation_tokens: Optional[Dict[int, float]] = None
-    perturbation: bool = False  # this will suppress blank outputs
+    perturbation: bool = False  # Enable attention manipulation
+    perturbation_tokens: Optional[Dict[int, float]] = None  # Token indices and their suppression factors
 
 
 @dataclass(frozen=True)
@@ -157,7 +157,7 @@ class PyTorchInference(Inference):
         value_modules = [block.attn.value for block in self.model.decoder.blocks]
         self.kv_modules = key_modules + value_modules
 
-    def logits(self, tokens: Tensor, audio_features: Tensor, perturbation: Optional[bool]=False, perturbation_tokens: Optional[Dict[int, float]] = None ) -> Tensor:
+    def logits(self, tokens: Tensor, audio_features: Tensor, perturbation: Optional[bool]=False, perturbation_tokens: Optional[Dict[int, float]] = None) -> Tensor:
         if not self.kv_cache:
             self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
 
@@ -165,11 +165,9 @@ class PyTorchInference(Inference):
             # only need to use the last token except in the first forward pass
             tokens = tokens[:, -1:]
 
-        if perturbation:
-            # print('In PyTorchInference logits function, perturbation =',perturbation)
-            return self.model.decoder.forward(tokens, audio_features, kv_cache=self.kv_cache)
-        
-        return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
+        return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache, 
+                                suppression=perturbation, 
+                                perturbation=perturbation_tokens)
 
     def cleanup_caching(self):
         for hook in self.hooks:
@@ -546,7 +544,11 @@ class DecodingTask:
         self.sample_begin: int = len(self.initial_tokens)
         self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
 
-        # inference: implements the forward pass through the decoder, including kv caching
+        # Initialize attention manipulation parameters
+        self.perturbation = options.perturbation
+        self.perturbation_tokens = options.perturbation_tokens
+        
+        # Pass parameters to inference
         self.inference = PyTorchInference(model, len(self.initial_tokens))
 
         # sequence ranker: implements how to rank a group of sampled sequences
@@ -651,28 +653,19 @@ class DecodingTask:
 
         return tuple(sorted(set(suppress_tokens)))
     
-# Added suppression and perturbation
-    def _get_audio_features(self, mel: Tensor, perturbation: Optional[bool]=False,perturbation_tokens: Optional[Dict[int, float]] = None):
+    def _get_audio_features(self, mel: Tensor, perturbation: Optional[bool]=False, perturbation_tokens: Optional[Dict[int, float]] = None):
         if self.options.fp16:
             mel = mel.half()
 
-        if mel.shape[-2:] == (
-            self.model.dims.n_audio_ctx,
-            self.model.dims.n_audio_state,
-        ):
-            # encoded audio features are given; skip audio encoding
+        if mel.shape[-2:] == (self.model.dims.n_audio_ctx, self.model.dims.n_audio_state):
             audio_features = mel
         else:
-            # Add here
-            # print('In _get_audio_features perturbation =',perturbation)
-            audio_features = self.model.encoder.forward(mel,suppression=perturbation, perturbation=perturbation_tokens) 
+            audio_features = self.model.encoder.forward(mel, 
+                                                      suppression=perturbation,
+                                                      perturbation=perturbation_tokens)
 
-        if audio_features.dtype != (
-            torch.float16 if self.options.fp16 else torch.float32
-        ):
-            return TypeError(
-                f"audio_features has an incorrect dtype: {audio_features.dtype}"
-            )
+        if audio_features.dtype != (torch.float16 if self.options.fp16 else torch.float32):
+            return TypeError(f"audio_features has incorrect dtype: {audio_features.dtype}")
 
         return audio_features
 
@@ -690,21 +683,17 @@ class DecodingTask:
 
         return languages, lang_probs
 
-    def _main_loop(self, audio_features: Tensor, tokens: Tensor, perturbation: Optional[bool]=False,perturbation_tokens: Optional[Dict[int, float]] = None, all_logits = None):
+    def _main_loop(self, audio_features: Tensor, tokens: Tensor, perturbation: Optional[bool]=False, perturbation_tokens: Optional[Dict[int, float]] = None, all_logits = None):
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
 
         all_logits : Tensor = torch.empty(self.sample_len, self.n_vocab, dtype=torch.float32, device=audio_features.device)
 
-        # print('In main loop, perturbation=', perturbation)
-
         try:
             for i in range(self.sample_len):
-                logits = self.inference.logits(tokens, audio_features, perturbation=perturbation, perturbation_tokens= perturbation_tokens)
+                logits = self.inference.logits(tokens, audio_features)
                 
-                # print('logit shape:',logits[:, -1].shape)
-
                 if (
                     i == 0 and self.tokenizer.no_speech is not None
                 ):  # save no_speech_probs
@@ -737,7 +726,6 @@ class DecodingTask:
         all_logits = []
 
         audio_features: Tensor = self._get_audio_features(mel, perturbation=self.options.perturbation, perturbation_tokens=self.options.perturbation_tokens)  # encoder forward pass
-        # print('Audio feature generated', audio_features.shape)
 
         tokens: Tensor = torch.tensor([self.initial_tokens]).repeat(n_audio, 1)
 
@@ -757,12 +745,9 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(audio_features.device)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs, all_logits = self._main_loop(audio_features, tokens,perturbation=self.options.perturbation, perturbation_tokens=self.options.perturbation_tokens, all_logits=all_logits)
-        # print('shape of all_logits',all_logits.shape)
-        # reshape the tensors to have (n_audio, n_group) as the first two dimensions
+        tokens, sum_logprobs, no_speech_probs, all_logits = self._main_loop(audio_features, tokens, perturbation=self.options.perturbation, perturbation_tokens=self.options.perturbation_tokens, all_logits=all_logits)
         
         audio_features = audio_features[:: self.n_group]
-        # print('Audio feature shape after reshaping the tensors to have (n_audio, n_group) as the first two dimensions:', audio_features.shape)
         no_speech_probs = no_speech_probs[:: self.n_group]
         assert audio_features.shape[0] == len(no_speech_probs) == n_audio
 
